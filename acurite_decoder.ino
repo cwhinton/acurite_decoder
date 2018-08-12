@@ -2,15 +2,76 @@
 #include "decoders.h"
 #include "rfm69_constants.h"
 #include <RFM69.h>
-#include "local_sprintf.h"
+//#include "local_sprintf.h"
+
+// Modified to decode the AcuRite 5 in 1 weather station
+// ** Acurite known message types
+#define ACURITE_MSGTYPE_TOWER_SENSOR                    0x04
+#define ACURITE_MSGTYPE_6045M                           0x2f
+#define ACURITE_MSGTYPE_5N1_WINDSPEED_WINDDIR_RAINFALL  0x31
+#define ACURITE_MSGTYPE_5N1_WINDSPEED_TEMP_HUMIDITY     0x38
 
 #define RX_PIN 14    // 14 == A0. Must be one of the analog pins, b/c of the analog comparator being used.
 
 #undef DEBUG
 
-#define VERSION "20180520"
+#define VERSION "20180811"
 
-AcuRiteDecoder adx;
+// From draythomp/Desert-home-rtl_433
+// matches acu-link internet bridge values
+// The mapping isn't circular, it jumps around.
+char * acurite_5n1_winddirection_str[] =
+    {"NW",  // 0  315
+     "WSW", // 1  247.5
+     "WNW", // 2  292.5
+     "W",   // 3  270
+     "NNW", // 4  337.5
+     "SW",  // 5  225
+     "N",   // 6  0
+     "SSW", // 7  202.5
+     "ENE", // 8  67.5
+     "SE",  // 9  135
+     "E",   // 10 90
+     "ESE", // 11 112.5
+     "NE",  // 12 45
+     "SSE", // 13 157.5
+     "NNE", // 14 22.5
+     "S"};  // 15 180
+
+
+const float acurite_5n1_winddirections[] =
+    { 315.0, // 0 - NW
+      247.5, // 1 - WSW
+      292.5, // 2 - WNW
+      270.0, // 3 - W
+      337.5, // 4 - NNW
+      225.0, // 5 - SW
+      0.0,   // 6 - N
+      202.5, // 7 - SSW
+      67.5,  // 8 - ENE
+      135.0, // 9 - SE
+      90.0,  // a - E
+      112.5, // b - ESE
+      45.0,  // c - NE
+      157.5, // d - SSE
+      22.5,  // e - NNE
+      180.0, // f - S
+    };
+
+    float tempc, tempf, wind_dird, rainfall = 0.0, wind_speed_kph, wind_speed_mph;
+    uint8_t humidity, sensor_status, message_type, sequence_num;
+    char channel, *wind_dirstr = "";
+    char channel_str[2];
+    uint16_t sensor_id;
+    int raincounter, temp, battery_low;
+// 5n1 keep state for how much rain has been seen so far
+    int acurite_5n1raincounter = 0;  // for 5n1 decoder
+    int acurite_5n1t_raincounter = 0;  // for combined 5n1/TXR decoder
+
+
+// AcuRite5N1Decoder manages the decoding of the physical layer
+AcuRite5N1Decoder adx;
+
 
 byte packetBuffer[60], packetFill;
 
@@ -45,6 +106,8 @@ static void setupPinChangeInterrupt () {
     ADMUX = RX_PIN - 14; // Note that this is specific to the analog pins...
 }
 
+//
+// Packet Buffer stuff
 void addData(const byte *buf, byte len)
 {
 #ifdef DEBUG
@@ -88,6 +151,8 @@ byte removeData(byte *buf, byte len_requested)
   return len_requested;
 }
 
+//
+// Runs the RF pulse detector in AcuRite5N1Decoder
 static void runPulseDecoders (volatile word& pulse) {
   // get next pulse with and reset it - need to protect against interrupts
   cli();
@@ -106,6 +171,8 @@ static void runPulseDecoders (volatile word& pulse) {
   }
 }
 
+//
+// talk to the RFM69
 uint16_t xfer16(uint16_t cmd)
 {
   uint16_t reply;
@@ -223,12 +290,128 @@ void PrintSource(const byte *data)
     break;
   }
 }
+float celsius2fahrenheit(float celsius) {
+  return celsius * 9 / 5 + 32;
+}
+
+
+float fahrenheit2celsius(float fahrenheit) {
+  return (fahrenheit - 32) / 1.8;
+}
+
+
+float kmph2mph(float kmph) {
+  return kmph / 1.609344;
+}
+
+float mph2kmph(float mph) {
+  return mph * 1.609344;
+}
+
+
+float mm2inch(float mm) {
+  return mm * 0.039370;
+}
+
+float inch2mm(float inch) {
+  return inch / 0.039370;
+}
+
+
+float kpa2psi(float kpa) {
+  return kpa / 6.89475729;
+}
+
+float psi2kpa(float psi) {
+    return psi * 6.89475729;
+}
+
+
+float hpa2inhg(float hpa) {
+    return hpa / 33.8639;
+}
+
+float inhg2hpa(float inhg) {
+    return inhg * 33.8639;
+}
+
+// The sensor sends the same data three times, each of these have
+// an indicator of which one of the three it is. This means the
+// checksum and first byte will be different for each one.
+// The bits 5,4 of byte 0 indicate which copy of the 65 bit data string
+//  00 = first copy
+//  01 = second copy
+//  10 = third copy
+//  1100 xxxx  = channel A 1st copy
+//  1101 xxxx  = channel A 2nd copy
+//  1110 xxxx  = channel A 3rd copy
+static int acurite_5n1_getMessageCaught(uint8_t byte){
+    return (byte & 0x30) >> 4;
+}
+
+//
+// Helper functions copied from rtl_433 and reused :)
+// Temperature encoding for 5-n-1 sensor and possibly others
+static float acurite_getTemp (uint8_t highbyte, uint8_t lowbyte) {
+    // range -40 to 158 F
+    int highbits = (highbyte & 0x0F) << 7 ;
+    int lowbits = lowbyte & 0x7F;
+    int rawtemp = highbits | lowbits;
+    float temp_F = (rawtemp - 400) / 10.0;
+    return temp_F;
+}
+
+static float acurite_getWindSpeed_kph (uint8_t highbyte, uint8_t lowbyte) {
+    // range: 0 to 159 kph
+    // raw number is cup rotations per 4 seconds
+    // http://www.wxforum.net/index.php?topic=27244.0 (found from weewx driver)
+	int highbits = ( highbyte & 0x1F) << 3;
+    int lowbits = ( lowbyte & 0x70 ) >> 4;
+    int rawspeed = highbits | lowbits;
+    float speed_kph = 0;
+    if (rawspeed > 0) {
+        speed_kph = rawspeed * 0.8278 + 1.0;
+    }
+    return speed_kph;
+}
+
+static int acurite_getHumidity (uint8_t byte) {
+    // range: 1 to 99 %RH
+    int humidity = byte & 0x7F;
+    return humidity;
+}
+
+static int acurite_getRainfallCounter (uint8_t hibyte, uint8_t lobyte) {
+    // range: 0 to 99.99 in, 0.01 in incr., rolling counter?
+	int raincounter = ((hibyte & 0x7f) << 7) | (lobyte & 0x7F);
+    return raincounter;
+}
+
+// The high 2 bits of byte zero are the channel (bits 7,6)
+//  00 = C
+//  10 = B
+//  11 = A
+static char chLetter[4] = {'C','E','B','A'}; // 'E' stands for error
+
+static char acurite_getChannel(uint8_t byte){
+    int channel = (byte & 0xC0) >> 6;
+    return chLetter[channel];
+}
+
+// 5-n-1 sensor ID is the last 12 bits of byte 0 & 1
+// byte 0     | byte 1
+// CC RR IIII | IIII IIII
+//
+static uint16_t acurite_5n1_getSensorId(uint8_t hibyte, uint8_t lobyte){
+    return ((hibyte & 0x0f) << 8) | lobyte;
+}
+
 
 void DecodePacket(const byte *data)
 {
 #ifdef DEBUG
   Serial.print("DecodePacket: ");
-    for (byte i = 0; i < 7; i++) {
+    for (byte i = 0; i < 8; i++) {
         Serial.print(' ');
         Serial.print((int) data[i], HEX);
     }
@@ -240,7 +423,7 @@ void DecodePacket(const byte *data)
     // ... Byte 1 might also not be parity-ing correctly. A new device
     // I bought in early 2018 has a parity error in byte 1, but
     // otherwise seems to work correctly.
-    for (int i=2; i<=5; i++) {
+    for (int i=2; i<=6; i++) {
       if (calcParity(data[i]) != (data[i] & 0x80)) {
 #ifdef DEBUG
         Serial.print("Parity failure in byte ");
@@ -250,12 +433,12 @@ void DecodePacket(const byte *data)
       }
     }
 
-    // Check checksum.
+    // Check mod-256 checksum of bytes 0 - 6 against byte 7
     unsigned char cksum = 0;
-    for (int i=0; i<=5; i++) {
+    for (int i=0; i<=6; i++) {
       cksum += data[i];
     }
-    if ((cksum & 0xFF) != data[6]) {
+    if ((cksum & 0xFF) != data[7]) {
       PrintSource(data);
       Serial.print(" checksum failure - calcd 0x");
       Serial.print(cksum, HEX);
@@ -263,89 +446,54 @@ void DecodePacket(const byte *data)
       Serial.println(data[6], HEX);
       return;
     }
+    
+    channel = acurite_getChannel(data[0]);
+    sprintf(channel_str, "%c", channel);
+    message_type = data[2] & 0x3f;
+    sensor_id = acurite_5n1_getSensorId(data[0],data[1]);
+    sequence_num = acurite_5n1_getMessageCaught(data[0]);
+    battery_low = (data[2] & 0x40) >> 6;
 
-    // If data[2] & 0x80 is set, that's a low battery condition.  At
-    // the same time, data[2] & 0x40 is *not* set (in my sample size
-    // of 1). I'm not sure if that means they always happen together
-    // or not.
-    int battery_low = 0;
-    if ((data[2] & 0xC0) != 0x40) {
-      if (data[2] & 0xC0 == 0x80) {
-	battery_low = 1;
-      } else {
-	PrintSource(data);
-	Serial.print(" abnormal status 0x");
-	Serial.println(data[2] & 0xC0, HEX);
-      }
-    }
-    
-    // Check the signature and warn if it doesn't match.
-    // (I'm assuming this is a signature; it might not be!)
-    if ((data[2] & 0x3F) != 0x04) {
-      PrintSource(data);
-      Serial.print(" Device signature 0x");
-      Serial.print(data[2] & 0x3F, HEX);
-      Serial.println(" does not match AcuRite signature 0x04");
-    }
+    if (message_type == ACURITE_MSGTYPE_5N1_WINDSPEED_WINDDIR_RAINFALL) {
+      // Wind speed, wind direction, and rain fall
+      wind_speed_kph = acurite_getWindSpeed_kph(data[3], data[4]);
+      wind_speed_mph = kmph2mph(wind_speed_kph);
+      wind_dird = acurite_5n1_winddirections[data[4] & 0x0f];
+      wind_dirstr = acurite_5n1_winddirection_str[data[4] & 0x0f];
+      raincounter = acurite_getRainfallCounter(data[5], data[6]);
+      if (acurite_5n1t_raincounter > 0) {
+          // track rainfall difference after first run
+          // FIXME when converting to structured output, just output
+          // the reading, let consumer track state/wrap around, etc.
+          rainfall = ( raincounter - acurite_5n1t_raincounter ) * 0.01;
+          if (raincounter < acurite_5n1t_raincounter) {
+              fprintf(stderr, "%s Acurite 5n1 sensor 0x%04X Ch %c, rain counter reset or wrapped around (old %d, new %d)\n",
+                  /*time_str,*/ sensor_id, channel, acurite_5n1t_raincounter, raincounter);
+              acurite_5n1t_raincounter = raincounter;
+          }
+        } else {
+            // capture starting counter
+            acurite_5n1t_raincounter = raincounter;
+            fprintf(stderr, "%s Acurite 5n1 sensor 0x%04X Ch %c, Total rain fall since last reset: %0.2f\n",
+            /*time_str,*/ sensor_id, channel, raincounter * 0.01);
+        }
 
-    PrintSource(data);
-    if ((data[3] & 0x7F) != 0x7F) {
-      Serial.print(" Humidity: ");
-      Serial.print(data[3] & 0x7f);
-      Serial.print("%");
+    } else if (message_type == ACURITE_MSGTYPE_5N1_WINDSPEED_TEMP_HUMIDITY) {
+      // Wind speed, temperature and humidity
+      wind_speed_kph = acurite_getWindSpeed_kph(data[3], data[4]);
+      wind_speed_mph = kmph2mph(wind_speed_kph);
+      tempf = acurite_getTemp(data[4], data[5]);
+      tempc = fahrenheit2celsius(tempf);
+      humidity = acurite_getHumidity(data[6]);
     }
-    
-    unsigned long t1 = ((data[4] & 0x0F) << 7) | (data[5] & 0x7F);
-    float temp = ((float)t1 - (float) 1024) / 10.0;
-    
-    // add manual calibration values to sensors...
-#if 0
-    unsigned long id = ((data[0] & 0x3f) << 7) | (data[1] & 0x7f);
-    if (id == 382) temp += 3.0;
-    if (id == 4454) temp += 2.6;
-    if (id == 59 || id == 2676) temp += 2.5; // temperature varies substantially from the others
-    if (id == 5296) temp += 3.0;
-#endif
-    
-    Serial.print(" Temperature: ");
-    Serial.print(temp);
-    Serial.print(" C (");
-    Serial.print(temp * 9.0 / 5.0 + 32.0);
-    Serial.print(" F) battery ");
-
-    if (battery_low) {
-      Serial.println("low");
-    } else {
-      Serial.println("ok");
-    }
-    
-    // relay data we want to see
-     /*
-    if ((data[0] & 0xC0) == 0xC0) { // channel A?
-      byte buf[50];
-      char msg[50];
-      float F = temp * 9.0 / 5.0 + 32.0;
-      cr_sprintf(msg, "A: %f deg", F);
-      buf[0] = 'D';
-      buf[1] = strlen(msg);
-      memcpy(&buf[2], msg, strlen(msg));
-
-      Serial.println("relaying"); 
-      radio.initialize(RF69_433MHZ, 2, 210);
-      radio.receiveDone();
-      radio.send(1, buf, strlen(msg) + 2, false);
-      rf69_init_OOK();
-    }
-      */
-      
 }
 
 void loop () {
     runPulseDecoders(pulse_width);
     
-    while (packetFill >= 7) {
+    while (packetFill >= (ACURITE_5N1_BITLEN / 8)) {
       byte dbuf[7];
-      removeData(dbuf, 7);
+      removeData(dbuf, (ACURITE_5N1_BITLEN / 8));
       DecodePacket(dbuf);
     }
 }

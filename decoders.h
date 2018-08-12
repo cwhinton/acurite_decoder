@@ -7,6 +7,8 @@
 #include <Arduino.h>
 #include <util/crc16.h>
 
+#define ACURITE_5N1_BITLEN		64
+
 class DecodeOOK {
 protected:
     byte bits, flip, state, pos, data[25];
@@ -132,9 +134,9 @@ public:
 #define BIT_WIDTH 1200 // total duration of a one-bit pulse
 #define NUM_SYNCS 4
 
-class AcuRiteDecoder : public DecodeOOK {
+class AcuRite5N1Decoder : public DecodeOOK {
  public:
-  AcuRiteDecoder () {}
+  AcuRite5N1Decoder () {}
 
   virtual char decode (word width) {
     char ret = 0;
@@ -198,7 +200,7 @@ class AcuRiteDecoder : public DecodeOOK {
       break;
     case T1:
 	gotBit(1);
-	if (pos >= 7) {
+	if (pos >= (ACURITE_5N1_BITLEN / 8)) {
 	  // Data ready to receive - packets are 7 bytes long
 	  reverseBits();
 	  return 1;
@@ -208,7 +210,7 @@ class AcuRiteDecoder : public DecodeOOK {
     case T2:
       gotBit(0);
       
-      if (pos >= 7) {
+      if (pos >= (ACURITE_5N1_BITLEN / 8)) {
 	// Data ready to receive - packets are 7 bytes long
 	reverseBits();
 	return 1;
